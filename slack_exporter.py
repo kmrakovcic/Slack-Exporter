@@ -1,5 +1,3 @@
-# slack_export.py
-
 import os
 import time
 import argparse
@@ -13,9 +11,6 @@ from tqdm import tqdm  # Progress bar
 
 # Load the environment variables from the .env file
 load_dotenv()
-
-# Get the Slack token from the environment variable
-client = WebClient(token=os.getenv('SLACK_BOT_TOKEN'))
 
 # Argument parsing
 parser = argparse.ArgumentParser(description="Slack Message Exporter")
@@ -33,8 +28,15 @@ message_cache = {}
 # Link pattern for Slack's custom link format <http://example.com|example> and also <http://example.com>
 link_pattern = re.compile(r'<(http[s]?://[^|>]+)(?:\|([^>]*))?>')
 
+def get_slack_tokens():
+    """Finds and returns all Slack tokens from the .env file."""
+    tokens = {}
+    for key, value in os.environ.items():
+        if key.endswith("_TOKEN"):
+            tokens[key] = value
+    return tokens
 
-def get_user_info(user_id):
+def get_user_info(client, user_id):
     """Fetches user information, using cache to reduce redundant API requests."""
     if user_id in user_cache:
         return user_cache[user_id]
@@ -47,8 +49,7 @@ def get_user_info(user_id):
     except SlackApiError as e:
         return "Unknown User"
 
-
-def get_workspace_name():
+def get_workspace_name(client):
     """Fetches the workspace (team) name."""
     try:
         response = client.team_info()
@@ -56,8 +57,18 @@ def get_workspace_name():
     except SlackApiError as e:
         return "default_workspace"
 
+def get_conversation_name(client, conversation):
+    """Gets the name of the conversation, handles channels, DMs, and MPIMs."""
+    if conversation['is_im']:  # Direct message
+        user_id = conversation['user']
+        user_name = get_user_info(client, user_id)
+        return f"DM with {user_name}"
+    elif conversation['is_mpim']:  # Multi-party direct message
+        return conversation['name']  # MPIMs have a name
+    else:  # Public or private channels
+        return conversation['name']
 
-def fetch_conversations():
+def fetch_conversations(client):
     """Fetches a list of all public/private channels, DMs (IMs), and multi-party DMs (MPIMs)."""
     conversations = []
     try:
@@ -78,8 +89,7 @@ def fetch_conversations():
         print(f"Error fetching conversations: {e.response['error']}", file=sys.stderr)
         return []
 
-
-def fetch_channel_by_id(channel_id):
+def fetch_channel_by_id(client, channel_id):
     """Fetches channel information using the channel ID."""
     try:
         response = client.conversations_info(channel=channel_id)
@@ -88,8 +98,7 @@ def fetch_channel_by_id(channel_id):
         print(f"Error fetching channel info by ID: {e.response['error']}")
         return None
 
-
-def fetch_channel_by_name(channel_name):
+def fetch_channel_by_name(client, channel_name):
     """Fetches channel information using the channel name."""
     try:
         # Fetch public and private channels, MPIMs, and filter by name
@@ -104,8 +113,7 @@ def fetch_channel_by_name(channel_name):
         print(f"Error fetching channels: {e.response['error']}")
         return None
 
-
-def fetch_channel_messages(channel_id, limit=1000):
+def fetch_channel_messages(client, channel_id, limit=1000):
     """Fetches the history of messages from a channel and filters out automatic messages."""
     try:
         result = client.conversations_history(channel=channel_id, limit=limit)
@@ -118,8 +126,7 @@ def fetch_channel_messages(channel_id, limit=1000):
     except SlackApiError as e:
         return []
 
-
-def fetch_replies(channel_id, thread_ts):
+def fetch_replies(client, channel_id, thread_ts):
     """Fetches replies for a specific thread in bulk and filters out automatic messages."""
     if thread_ts in message_cache:
         return message_cache[thread_ts]
@@ -136,11 +143,9 @@ def fetch_replies(channel_id, thread_ts):
     except SlackApiError as e:
         return []
 
-
 def convert_ts_to_datetime(ts):
     """Converts Slack's timestamp format into a readable datetime format."""
     return datetime.fromtimestamp(float(ts), timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
 
 def parse_links(text, output_type='txt'):
     """Parse Slack's custom link format <http://example.com|example> and handle both <url|text> and <url>."""
@@ -155,8 +160,7 @@ def parse_links(text, output_type='txt'):
 
     return link_pattern.sub(replace_link, text)
 
-
-def save_messages_to_txt(messages, conversation_name, conversation_id, workspace_folder, pbar):
+def save_messages_to_txt(client, messages, conversation_name, conversation_id, workspace_folder, pbar):
     sanitized_conversation_name = "".join(
         [c for c in conversation_name if c.isalnum() or c in (' ', '-', '_')]).rstrip()
 
@@ -170,7 +174,7 @@ def save_messages_to_txt(messages, conversation_name, conversation_id, workspace
             text = parse_links(message.get('text', ''), 'txt')
             timestamp = message.get('ts', '')
             user_id = message.get('user', '')
-            user_name = get_user_info(user_id)
+            user_name = get_user_info(client, user_id)
             formatted_time = convert_ts_to_datetime(timestamp)
 
             # Write the main message
@@ -179,13 +183,13 @@ def save_messages_to_txt(messages, conversation_name, conversation_id, workspace
             # Check for replies and fetch them in bulk
             if 'thread_ts' in message:
                 thread_ts = message['thread_ts']
-                replies = fetch_replies(conversation_id, thread_ts)
+                replies = fetch_replies(client, conversation_id, thread_ts)
                 if replies:
                     for reply in replies:
                         reply_text = parse_links(reply.get('text', ''), 'txt')
                         reply_ts = reply.get('ts', '')
                         reply_user_id = reply.get('user', '')
-                        reply_user_name = get_user_info(reply_user_id)
+                        reply_user_name = get_user_info(client, reply_user_id)
                         reply_time = convert_ts_to_datetime(reply_ts)
 
                         # Indent replies under the parent message
@@ -194,8 +198,7 @@ def save_messages_to_txt(messages, conversation_name, conversation_id, workspace
             pbar.update(1)  # Update progress bar for each processed message
     tqdm.write(f"Messages saved to {filename}")
 
-
-def save_messages_to_html(messages, conversation_name, conversation_id, workspace_folder, pbar):
+def save_messages_to_html(client, messages, conversation_name, conversation_id, workspace_folder, pbar):
     sanitized_conversation_name = "".join(
         [c for c in conversation_name if c.isalnum() or c in (' ', '-', '_')]).rstrip()
 
@@ -210,7 +213,7 @@ def save_messages_to_html(messages, conversation_name, conversation_id, workspac
             text = parse_links(message.get('text', ''), 'html')
             timestamp = message.get('ts', '')
             user_id = message.get('user', '')
-            user_name = get_user_info(user_id)
+            user_name = get_user_info(client, user_id)
             formatted_time = convert_ts_to_datetime(timestamp)
 
             # Write the main message
@@ -219,14 +222,14 @@ def save_messages_to_html(messages, conversation_name, conversation_id, workspac
             # Check for replies and fetch them
             if 'thread_ts' in message:
                 thread_ts = message['thread_ts']
-                replies = fetch_replies(conversation_id, thread_ts)
+                replies = fetch_replies(client, conversation_id, thread_ts)
                 if replies:
                     file.write(f"<ul>\n")  # Indent replies under the parent message
                     for reply in replies:
                         reply_text = parse_links(reply.get('text', ''), 'html')
                         reply_ts = reply.get('ts', '')
                         reply_user_id = reply.get('user', '')
-                        reply_user_name = get_user_info(reply_user_id)
+                        reply_user_name = get_user_info(client, reply_user_id)
                         reply_time = convert_ts_to_datetime(reply_ts)
                         file.write(f"<li><strong>[{reply_time}] {reply_user_name}:</strong> {reply_text}</li>\n")
                     file.write("</ul>\n")  # End the indentation for replies
@@ -234,67 +237,68 @@ def save_messages_to_html(messages, conversation_name, conversation_id, workspac
         file.write("</ul></body></html>")
     tqdm.write(f"Messages saved to {filename}")
 
-
-def get_conversation_name(conversation):
-    """Gets the name of the conversation, handles channels, DMs, and MPIMs."""
-    if conversation['is_im']:  # Direct message
-        user_id = conversation['user']
-        user_name = get_user_info(user_id)
-        return f"DM with {user_name}"
-    elif conversation['is_mpim']:  # Multi-party direct message
-        return conversation['name']  # MPIMs have a name
-    else:  # Public or private channels
-        return conversation['name']
-
-
 def main():
-    # Get the workspace name
-    workspace_name = get_workspace_name()
-
-    # Fetch all conversations (public channels, private channels, DMs, MPIMs)
-    conversations = fetch_conversations()
-
-    # Filter the conversations if a specific conversation name or ID is provided
-    conversation = None
-    if args.channel_name_or_id:
-        if args.channel_name_or_id.startswith('C') or args.channel_name_or_id.startswith('D'):
-            # Try to fetch by ID directly (works for channels and DMs)
-            conversation = fetch_channel_by_id(args.channel_name_or_id)
-        else:
-            # Fetch by name (channels, MPIMs)
-            conversation = fetch_channel_by_name(args.channel_name_or_id)
-    else:
-        print("No conversation name or ID provided.", file=sys.stderr)
+    tokens = get_slack_tokens()
+    if not tokens:
+        print("No Slack tokens found in .env file.")
         return
 
-    if conversation:
+    found_channels = []
+
+    # Try each Slack workspace token and look for the channel
+    for workspace, token in tokens.items():
+        client = WebClient(token=token)
+        workspace_name = get_workspace_name(client)
+        tqdm.write(f"Checking workspace: {workspace_name} ({workspace})")
+
+        # Fetch all conversations in this workspace
+        conversations = fetch_conversations(client)
+
+        # Look for the specified channel name or ID
+        conversation = None
+        if args.channel_name_or_id:
+            if args.channel_name_or_id.startswith('C') or args.channel_name_or_id.startswith('D'):
+                # Try to fetch by ID directly (works for channels and DMs)
+                conversation = fetch_channel_by_id(client, args.channel_name_or_id)
+            else:
+                # Fetch by name (channels, MPIMs)
+                conversation = fetch_channel_by_name(client, args.channel_name_or_id)
+
+        if conversation:
+            conversation_id = conversation['id']
+            # Use the helper function to get the conversation name, handles channels and DMs
+            conversation_name = get_conversation_name(client, conversation)
+
+            # Store the found channel information
+            found_channels.append((client, conversation, workspace_name))
+
+            tqdm.write(f"Found channel '{conversation_name}' in {workspace_name}.")
+
+    if not found_channels:
+        print(f"Channel '{args.channel_name_or_id}' not found in any workspaces.")
+        return
+
+    # Download messages for all found channels
+    for client, conversation, workspace_name in found_channels:
         conversation_id = conversation['id']
-        conversation_name = get_conversation_name(conversation)
-
-        # Print progress for conversation processing
-        tqdm.write(f"Processing {conversation_name} (ID: {conversation_id})", file=sys.stderr)
-
-        # Fetch messages from the conversation
-        messages = fetch_channel_messages(conversation_id)
+        conversation_name = get_conversation_name(client, conversation)
+        messages = fetch_channel_messages(client, conversation_id)
 
         # Reverse the message order to go from oldest to newest
         messages = list(reversed(messages))
 
-        # Create a folder for the workspace
+        # Create a folder for each workspace
         workspace_folder = workspace_name.replace(' ', '_')
 
         # Use a progress bar to indicate how many messages have been processed
-        with tqdm(total=len(messages), desc=f"Processing {conversation_name}") as pbar:
-            # Save the messages to a text file or HTML file based on user selection
+        with tqdm(total=len(messages), desc=f"Processing {conversation_name} from {workspace_name}") as pbar:
             if messages:
                 if args.output_type == 'txt':
-                    save_messages_to_txt(messages, conversation_name, conversation_id, workspace_folder, pbar)
+                    save_messages_to_txt(client, messages, conversation_name, conversation_id, workspace_folder, pbar)
                 elif args.output_type == 'html':
-                    save_messages_to_html(messages, conversation_name, conversation_id, workspace_folder, pbar)
+                    save_messages_to_html(client, messages, conversation_name, conversation_id, workspace_folder, pbar)
             else:
-                print(f"No messages found for {conversation_name} or an error occurred.", file=sys.stderr)
-    else:
-        print("No valid conversation found.", file=sys.stderr)
+                print(f"No messages found for channel {conversation_name} in {workspace_name}.")
 
 
 if __name__ == "__main__":
